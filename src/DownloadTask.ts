@@ -108,12 +108,14 @@ export class DownloadTask {
   onBegin (params: BeginHandlerParams) {
     this.state = 'DOWNLOADING'
     this.bytesTotal = params.expectedBytes
+    params.metadata = this.tryParseJson(params.metadata) ?? this.metadata
     this.beginHandler?.(params)
   }
 
   onProgress (params: ProgressHandlerParams) {
     this.bytesDownloaded = params.bytesDownloaded
     this.bytesTotal = params.bytesTotal
+    params.metadata = this.tryParseJson(params.metadata) ?? this.metadata
     this.progressHandler?.(params)
   }
 
@@ -121,11 +123,13 @@ export class DownloadTask {
     this.state = 'DONE'
     this.bytesDownloaded = params.bytesDownloaded
     this.bytesTotal = params.bytesTotal
+    params.metadata = this.tryParseJson(params.metadata) ?? this.metadata
     this.doneHandler?.(params)
   }
 
   onError (params: ErrorHandlerParams) {
     this.state = 'FAILED'
+    params.metadata = this.tryParseJson(params.metadata) ?? this.metadata
     this.errorHandler?.(params)
   }
 

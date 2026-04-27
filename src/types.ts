@@ -66,6 +66,7 @@ export type SetConfig = (config: Partial<Config>) => void
 export type BeginHandlerParams = {
   expectedBytes: number
   headers: Headers
+  metadata?: Metadata
 }
 
 export type BeginHandler = (params: BeginHandlerParams) => void
@@ -73,6 +74,7 @@ export type BeginHandler = (params: BeginHandlerParams) => void
 export type ProgressHandlerParams = {
   bytesDownloaded: number
   bytesTotal: number
+  metadata?: Metadata
 }
 
 export type ProgressHandler = (params: ProgressHandlerParams) => void
@@ -81,6 +83,7 @@ export type DoneHandlerParams = {
   location: string
   bytesDownloaded: number
   bytesTotal: number
+  metadata?: Metadata
 }
 
 export type DoneHandler = (params: DoneHandlerParams) => void
@@ -88,6 +91,7 @@ export type DoneHandler = (params: DoneHandlerParams) => void
 export interface ErrorHandlerParams {
   error: string
   errorCode: number
+  metadata?: Metadata
 }
 
 export type ErrorHandler = (params: ErrorHandlerParams) => void
