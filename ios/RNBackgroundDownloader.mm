@@ -63,6 +63,8 @@ static CompletionHandler storedCompletionHandler;
     BOOL isSessionActivated;
     // Queue of download operations waiting for session activation
     NSMutableArray<dispatch_block_t> *pendingDownloads;
+    // Queue of session queries waiting for activation
+    NSMutableArray<dispatch_block_t> *pendingSessionQueries;
     // Controls whether debug logs are sent to JS
     BOOL isLogsEnabled;
 
@@ -94,11 +96,51 @@ RCT_EXPORT_MODULE();
 #pragma mark - Helper methods
 
 - (RNBGDTaskConfig *)configForTask:(NSURLSessionTask *)task {
-    return taskToConfigMap[@(task.taskIdentifier)];
+    RNBGDTaskConfig *config = taskToConfigMap[@(task.taskIdentifier)];
+    if (config != nil) {
+        return config;
+    }
+
+    NSString *configId = task.taskDescription;
+    if (configId == nil) {
+        configId = task.currentRequest.allHTTPHeaderFields[@"configId"];
+    }
+    if (configId == nil && task.originalRequest != nil) {
+        configId = task.originalRequest.allHTTPHeaderFields[@"configId"];
+    }
+
+    if (configId != nil) {
+        config = [self findConfigById:configId];
+    }
+
+    return config;
 }
 
 - (RNBGDUploadTaskConfig *)uploadConfigForTask:(NSURLSessionTask *)task {
-    return uploadTaskToConfigMap[@(task.taskIdentifier)];
+    RNBGDUploadTaskConfig *config = uploadTaskToConfigMap[@(task.taskIdentifier)];
+    if (config != nil) {
+        return config;
+    }
+
+    NSString *configId = task.taskDescription;
+    if (configId == nil) {
+        configId = task.currentRequest.allHTTPHeaderFields[@"configId"];
+    }
+    if (configId == nil && task.originalRequest != nil) {
+        configId = task.originalRequest.allHTTPHeaderFields[@"configId"];
+    }
+
+    if (configId != nil) {
+        for (NSNumber *key in uploadTaskToConfigMap) {
+            RNBGDUploadTaskConfig *uploadConfig = uploadTaskToConfigMap[key];
+            if ([uploadConfig.id isEqualToString:configId]) {
+                config = uploadConfig;
+                break;
+            }
+        }
+    }
+
+    return config;
 }
 
 - (dispatch_queue_t)methodQueue
@@ -268,6 +310,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
         idToUpdatedHeadersMap = [[NSMutableDictionary alloc] init];
         isSessionActivated = NO;
         pendingDownloads = [[NSMutableArray alloc] init];
+        pendingSessionQueries = [[NSMutableArray alloc] init];
 
 #ifdef RCT_NEW_ARCH_ENABLED
         pendingEmitEvents = [[NSMutableArray alloc] init];
@@ -342,6 +385,12 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
                 downloadBlock();
             }
             [self->pendingDownloads removeAllObjects];
+
+            // Process any pending session queries queued before activation finished
+            for (dispatch_block_t queryBlock in self->pendingSessionQueries) {
+                queryBlock();
+            }
+            [self->pendingSessionQueries removeAllObjects];
         }
     }];
 }
@@ -354,6 +403,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     }
     isSessionActivated = NO;
     [pendingDownloads removeAllObjects];
+    [pendingSessionQueries removeAllObjects];
 }
 
 - (void)registerBridgeListener {
@@ -384,12 +434,23 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 
 - (void)handleBridgeAppEnterForeground:(NSNotification *) note {
     DLog(nil, @"[RNBackgroundDownloader] - [handleBridgeAppEnterForeground]");
+    [self lazyRegisterSession];
     [self resumeTasks];
 }
 
 - (void)resumeTasks {
     @synchronized (sharedLock) {
         DLog(nil, @"[RNBackgroundDownloader] - [resumeTasks]");
+        if (urlSession == nil) {
+            [self sendDebugLog:@"resumeTasks: urlSession is nil, resetting session" taskId:nil];
+            [self resetSessionIfNeeded];
+        }
+
+        if (urlSession == nil) {
+            DLog(nil, @"[RNBackgroundDownloader] - [resumeTasks] no session available after reset");
+            return;
+        }
+
         [urlSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> * _Nonnull dataTasks, NSArray<NSURLSessionUploadTask *> * _Nonnull uploadTasks, NSArray<NSURLSessionDownloadTask *> * _Nonnull downloadTasks) {
             for (NSURLSessionDownloadTask *task in downloadTasks) {
                 // running - 0
@@ -867,7 +928,41 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                 }
                 [task resume];
             } else {
-                DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] no task or resume data found for %@", identifier);
+                RNBGDTaskConfig *taskConfig = [self findConfigById:identifier];
+                if (taskConfig != nil && taskConfig.errorCode == NSURLErrorCancelled) {
+                    DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] restarting cancelled task without resume data for %@", identifier);
+
+                    NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:[NSURL URLWithString:taskConfig.url]];
+                    [request setValue:identifier forHTTPHeaderField:@"configId"];
+
+                    if (updatedHeaders != nil && [updatedHeaders count] > 0) {
+                        for (NSString *headerKey in updatedHeaders) {
+                            [request setValue:[updatedHeaders valueForKey:headerKey] forHTTPHeaderField:headerKey];
+                        }
+                        [idToUpdatedHeadersMap removeObjectForKey:identifier];
+                    }
+
+                    NSURLSessionDownloadTask *newTask = [urlSession downloadTaskWithRequest:request];
+                    if (newTask != nil) {
+                        newTask.taskDescription = identifier;
+                        NSNumber *oldKey = [self findTaskKeyById:identifier];
+                        if (oldKey != nil) {
+                            [taskToConfigMap removeObjectForKey:oldKey];
+                        }
+
+                        taskConfig.state = NSURLSessionTaskStateRunning;
+                        taskConfig.errorCode = 0;
+                        taskConfig.hasResumeData = NO;
+                        taskToConfigMap[@(newTask.taskIdentifier)] = taskConfig;
+                        [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+                        self->idToTaskMap[identifier] = newTask;
+                        [newTask resume];
+                    } else {
+                        DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] failed to restart cancelled task for %@", identifier);
+                    }
+                } else {
+                    DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] no task or resume data found for %@", identifier);
+                }
             }
         }
         resolve(nil);
@@ -987,6 +1082,20 @@ RCT_EXPORT_METHOD(completeHandler:(nonnull NSString *)jobId resolver:(RCTPromise
     [self sendDebugLog:@"getExistingDownloadTasks: starting" taskId:nil];
     [self lazyRegisterSession];
 
+    // If session is not yet activated, queue this query until activation completes.
+    if (!isSessionActivated) {
+        DLog(nil, @"[RNBackgroundDownloader] - [getExistingDownloadTasks] session not activated, queueing query");
+        __weak RNBackgroundDownloader *weakSelf = self;
+        dispatch_block_t queryBlock = ^{
+            RNBackgroundDownloader *strongSelf = weakSelf;
+            if (strongSelf) {
+                [strongSelf getExistingDownloadTasks:resolve reject:reject];
+            }
+        };
+        [pendingSessionQueries addObject:queryBlock];
+        return;
+    }
+
     // Defensive check: if session is nil, reject instead of hanging
     if (urlSession == nil) {
         [self sendDebugLog:@"getExistingDownloadTasks: ERROR - urlSession is nil" taskId:nil];
@@ -1018,7 +1127,8 @@ RCT_EXPORT_METHOD(completeHandler:(nonnull NSString *)jobId resolver:(RCTPromise
                         [foundTasks addObject:[self createTaskInfo:mutableTask config:taskConfig]];
                         [processedIds addObject:taskConfig.id];
                     } else {
-                        [task cancel];
+                        DLog(nil, @"[RNBackgroundDownloader] - [getExistingDownloadTasks] unable to reconcile task, leaving it alive for future recovery");
+                        [self sendDebugLog:@"getExistingDownloadTasks: found unknown task, not cancelling" taskId:nil];
                     }
                 }
 
@@ -1076,10 +1186,28 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         configId = task.originalRequest.allHTTPHeaderFields[@"configId"];
     }
 
-    for (NSNumber *key in taskToConfigMap) {
-        RNBGDTaskConfig *config = taskToConfigMap[key];
-        if ([config.id isEqualToString:configId]) {
-            return config;
+    if (configId != nil) {
+        for (NSNumber *key in taskToConfigMap) {
+            RNBGDTaskConfig *config = taskToConfigMap[key];
+            if ([config.id isEqualToString:configId]) {
+                return config;
+            }
+        }
+    }
+
+    // Fallback: try to match by original request URL if the config id was lost.
+    NSString *taskUrl = task.currentRequest.URL.absoluteString;
+    if (taskUrl == nil && task.originalRequest != nil) {
+        taskUrl = task.originalRequest.URL.absoluteString;
+    }
+
+    if (taskUrl != nil) {
+        for (NSNumber *key in taskToConfigMap) {
+            RNBGDTaskConfig *config = taskToConfigMap[key];
+            if ([config.url isEqualToString:taskUrl]) {
+                DLog(nil, @"[RNBackgroundDownloader] - [findAndReconcileTaskConfig] fallback matched by URL for %@", config.id);
+                return config;
+            }
         }
     }
 
@@ -1191,6 +1319,23 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
                 [mmkv setData:[self serialize:taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                 DLog(taskConfig.id, @"[RNBackgroundDownloader] - [addPausedTasksToResults] resume data file not found for task: %@", taskConfig.id);
             }
+        }
+    }
+
+    // Fallback: if a known task config remains and was cancelled with -999,
+    // return it as a paused task so JS can still see it after app switch.
+    for (RNBGDTaskConfig *taskConfig in [taskToConfigMap allValues]) {
+        if ([processedIds containsObject:taskConfig.id]) {
+            continue;
+        }
+
+        if (taskConfig.errorCode == NSURLErrorCancelled) {
+            if (taskConfig.state != NSURLSessionTaskStateCanceling) {
+                taskConfig.state = NSURLSessionTaskStateCanceling;
+            }
+            DLog(taskConfig.id, @"[RNBackgroundDownloader] - [addPausedTasksToResults] returning preserved cancelled task: %@", taskConfig.id);
+            [foundTasks addObject:[self createTaskInfoFromConfig:taskConfig]];
+            [processedIds addObject:taskConfig.id];
         }
     }
 }
@@ -1517,19 +1662,26 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         // Extract resume data first before checking isPausedTask
         NSData *resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData];
 
-        // Check if this task was intentionally paused (marked in idsToPauseSet)
+        // Treat any known task cancelled by the system as a paused task.
+        // This includes app switch / background cancel events where iOS may deliver -999.
         BOOL wasIntentionallyPaused = [idsToPauseSet containsObject:taskConfig.id];
         BOOL hasResumeData = resumeData != nil;
-        BOOL isPausedTask = (error.code == NSURLErrorCancelled && (wasIntentionallyPaused || hasResumeData));
+        BOOL isPausedTask = (error.code == NSURLErrorCancelled && (wasIntentionallyPaused || hasResumeData || taskConfig != nil));
 
         if (isPausedTask) {
+            taskConfig.state = NSURLSessionTaskStateCanceling;
             taskConfig.errorCode = error.code;
+            taskConfig.hasResumeData = hasResumeData;
 
             // Store resume data so we can resume the download later
             if (taskConfig.id && resumeData) {
                 idToResumeDataMap[taskConfig.id] = resumeData;
             }
-            DLog(taskConfig.id, @"[RNBackgroundDownloader] - [didCompleteWithError] task was paused, ignoring error for %@", taskConfig.id);
+
+            // Persist the pause state so getExistingDownloadTasks can recover it
+            [mmkv setData:[self serialize:taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+
+            DLog(taskConfig.id, @"[RNBackgroundDownloader] - [didCompleteWithError] task was paused or system cancelled, preserving %@", taskConfig.id);
             return;
         }
 
@@ -1596,6 +1748,22 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 
 - (void)URLSessionDidFinishEventsForBackgroundURLSession:(NSURLSession *)session {
     DLog(nil, @"[RNBackgroundDownloader] - [URLSessionDidFinishEventsForBackgroundURLSession]");
+}
+
+- (void)URLSession:(NSURLSession *)session didBecomeInvalidWithError:(nullable NSError *)error {
+    @synchronized (sharedLock) {
+        NSString *message = error
+            ? [NSString stringWithFormat:@"URLSession didBecomeInvalidWithError: %@", error.localizedDescription]
+            : @"URLSession didBecomeInvalid";
+        DLog(nil, @"[RNBackgroundDownloader] - %@", message);
+        [self sendDebugLog:message taskId:nil];
+
+        if (self->urlSession == session) {
+            self->urlSession = nil;
+            self->isSessionActivated = NO;
+            [self->pendingDownloads removeAllObjects];
+        }
+    }
 }
 
 #pragma mark - Upload methods
@@ -1866,6 +2034,19 @@ RCT_EXPORT_METHOD(stopUploadTask:(NSString *)id resolver:(RCTPromiseResolveBlock
 - (void)getExistingUploadTasks:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
     DLog(nil, @"[RNBackgroundDownloader] - [getExistingUploadTasks]");
     [self lazyRegisterSession];
+
+    if (!isSessionActivated) {
+        DLog(nil, @"[RNBackgroundDownloader] - [getExistingUploadTasks] session not activated, queueing query");
+        __weak RNBackgroundDownloader *weakSelf = self;
+        dispatch_block_t queryBlock = ^{
+            RNBackgroundDownloader *strongSelf = weakSelf;
+            if (strongSelf) {
+                [strongSelf getExistingUploadTasks:resolve reject:reject];
+            }
+        };
+        [pendingSessionQueries addObject:queryBlock];
+        return;
+    }
 
     if (urlSession == nil) {
         reject(@"ERR_SESSION_NIL", @"URL session could not be initialized", nil);
