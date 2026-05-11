@@ -689,6 +689,10 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
             return;
         }
 
+        // Preserve the task identifier across background restores so we can
+        // reliably reconcile it later if the app is restarted or resumed.
+        task.taskDescription = identifier;
+
         [self sendDebugLog:[NSString stringWithFormat:@"executeDownloadWithRequest: task created with taskIdentifier=%lu",
                             (unsigned long)task.taskIdentifier]
                     taskId:identifier];
@@ -820,6 +824,8 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                 }
 
                 if (newTask != nil) {
+                    newTask.taskDescription = identifier;
+
                     // Get the task config from the old task or find by id
                     RNBGDTaskConfig *taskConfig = nil;
                     if (task != nil) {
@@ -1059,8 +1065,16 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 }
 
 - (RNBGDTaskConfig *)findAndReconcileTaskConfig:(NSURLSessionDownloadTask *)task {
-    // The task.taskIdentifier may change after app restart, so we use configId from headers
-    NSString *configId = task.currentRequest.allHTTPHeaderFields[@"configId"];
+    // The task.taskIdentifier may change after app restart, so we use a persisted
+    // identifier when possible. taskDescription is more stable than custom headers
+    // for background session restoration.
+    NSString *configId = task.taskDescription;
+    if (configId == nil) {
+        configId = task.currentRequest.allHTTPHeaderFields[@"configId"];
+    }
+    if (configId == nil && task.originalRequest != nil) {
+        configId = task.originalRequest.allHTTPHeaderFields[@"configId"];
+    }
 
     for (NSNumber *key in taskToConfigMap) {
         RNBGDTaskConfig *config = taskToConfigMap[key];
@@ -1086,6 +1100,10 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
             *taskPtr = [urlSession downloadTaskWithResumeData:resumeData];
         } else {
             *taskPtr = [urlSession downloadTaskWithURL:task.currentRequest.URL];
+        }
+
+        if (*taskPtr != nil) {
+            (*taskPtr).taskDescription = task.taskDescription;
         }
     }
 }
