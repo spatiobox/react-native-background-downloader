@@ -343,14 +343,6 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     [self unregisterBridgeListener];
 }
 
-// Background NSURLSession transfers continue while the app is backgrounded.
-// Do not cancel running downloads on app background transitions: cancelByProducingResumeData
-// converts them into paused tasks and prevents iOS from continuing the transfer in the
-// background. Pause should only happen when JS explicitly calls pauseTask.
-- (void)autoPauseActiveTasks {
-    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] deprecated no-op; background downloads continue via NSURLSession");
-}
-
 - (void)handleBridgeHotReload:(NSNotification *) note {
     DLog(nil, @"[RNBackgroundDownloader] - [handleBridgeHotReload]");
     [self unregisterSession];
@@ -573,24 +565,6 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 #else
 RCT_EXPORT_METHOD(setLogsEnabled:(BOOL)enabled) {
     [self _setLogsEnabledInternal:enabled];
-}
-#endif
-
-// Deprecated compatibility method. It intentionally does not pause tasks because
-// background NSURLSession downloads must remain active to continue outside the app.
-- (void)_autoPauseActiveTasksInternal:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] deprecated no-op called from JS");
-    [self autoPauseActiveTasks];
-    resolve(nil);
-}
-
-#ifdef RCT_NEW_ARCH_ENABLED
-- (void)autoPauseActiveTasks:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    [self _autoPauseActiveTasksInternal:resolve reject:reject];
-}
-#else
-RCT_EXPORT_METHOD(autoPauseActiveTasks:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject) {
-    [self _autoPauseActiveTasksInternal:resolve reject:reject];
 }
 #endif
 

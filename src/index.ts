@@ -508,12 +508,6 @@ export const completeHandler = (jobId: string) => {
   return nativeModule.completeHandler(jobId)
 }
 
-// Deprecated compatibility no-op on iOS; background downloads continue via NSURLSession.
-export const autoPauseActiveTasks = async (): Promise<void> => {
-  const nativeModule = ensureNativeModuleInitialized()
-  return nativeModule.autoPauseActiveTasks()
-}
-
 export function createDownloadTask ({
   isAllowedOverRoaming = true,
   isAllowedOverMetered = true,
