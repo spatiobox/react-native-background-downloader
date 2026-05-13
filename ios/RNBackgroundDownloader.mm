@@ -969,6 +969,9 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
             // Remove from pause set when resuming
             [idsToPauseSet removeObject:identifier];
 
+            // Flag to track if resume was actually executed
+            BOOL resumeExecuted = NO;
+
             NSData *resumeData = self->idToResumeDataMap[identifier];
             NSURLSessionDownloadTask *task = self->idToTaskMap[identifier];
             if (task == nil) {
@@ -1049,6 +1052,48 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                     // Delete the resume data file after successful resume
                     [self deleteResumeDataForTaskId:identifier];
                     [newTask resume];
+                    resumeExecuted = YES;
+                } else {
+                    DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] failed to create task from resume data for %@", identifier);
+                    // Resume data is corrupted or expired, try to restart without resume data
+                    RNBGDTaskConfig *taskConfig = [self findConfigById:identifier];
+                    if (taskConfig != nil) {
+                        DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] restarting task without resume data after failed resumption for %@", identifier);
+                        NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:[NSURL URLWithString:taskConfig.url]];
+                        [request setValue:identifier forHTTPHeaderField:@"configId"];
+
+                        if (updatedHeaders != nil && [updatedHeaders count] > 0) {
+                            for (NSString *headerKey in updatedHeaders) {
+                                [request setValue:[updatedHeaders valueForKey:headerKey] forHTTPHeaderField:headerKey];
+                            }
+                            [idToUpdatedHeadersMap removeObjectForKey:identifier];
+                        }
+
+                        NSURLSessionDownloadTask *fallbackTask = [urlSession downloadTaskWithRequest:request];
+                        if (fallbackTask != nil) {
+                            fallbackTask.taskDescription = identifier;
+                            NSNumber *oldKey = [self findTaskKeyById:identifier];
+                            if (oldKey != nil) {
+                                [taskToConfigMap removeObjectForKey:oldKey];
+                            }
+                            taskConfig.state = NSURLSessionTaskStateRunning;
+                            taskConfig.errorCode = 0;
+                            taskConfig.hasResumeData = NO;
+                            taskToConfigMap[@(fallbackTask.taskIdentifier)] = taskConfig;
+                            [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+                            self->idToTaskMap[identifier] = fallbackTask;
+                            [self->idToResumeDataMap removeObjectForKey:identifier];
+                            [self deleteResumeDataForTaskId:identifier];
+                            [fallbackTask resume];
+                            resumeExecuted = YES;
+                        } else {
+                            reject(@"ERR_RESUME_TASK", @"Failed to create download task from resume data or fallback request", nil);
+                            return;
+                        }
+                    } else {
+                        reject(@"ERR_RESUME_TASK", @"Failed to create download task from resume data and task config not found", nil);
+                        return;
+                    }
                 }
             } else if (task != nil && task.state == NSURLSessionTaskStateRunning) {
                 // Already active. getExistingDownloadTasks may have called restoreTaskIfNeeded which
@@ -1062,6 +1107,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                     taskConfig.state = task.state;
                     taskConfig.errorCode = task.error ? task.error.code : 0;
                 }
+                resumeExecuted = YES;
             } else if (task != nil && task.state == NSURLSessionTaskStateSuspended) {
                 // Task was suspended normally, just resume it
                 DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] resuming suspended task for %@", identifier);
@@ -1071,6 +1117,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                     taskConfig.errorCode = 0;
                 }
                 [task resume];
+                resumeExecuted = YES;
             } else {
                 RNBGDTaskConfig *taskConfig = [self findConfigById:identifier];
                 if (taskConfig != nil && taskConfig.errorCode == NSURLErrorCancelled) {
@@ -1101,6 +1148,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                         [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                         self->idToTaskMap[identifier] = newTask;
                         [newTask resume];
+                        resumeExecuted = YES;
                     } else {
                         DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] failed to restart cancelled task for %@", identifier);
                         reject(@"ERR_RESUME_TASK", @"Failed to create download task", nil);
@@ -1139,6 +1187,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                             [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                             self->idToTaskMap[identifier] = newTask;
                             [newTask resume];
+                            resumeExecuted = YES;
                         } else {
                             DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] failed to restart paused task for %@", identifier);
                             reject(@"ERR_RESUME_TASK", @"Failed to create download task", nil);
