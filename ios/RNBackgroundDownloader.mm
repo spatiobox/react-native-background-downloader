@@ -521,8 +521,10 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
                 BOOL intentionallyPaused = (taskId != nil && [self->idsToPauseSet containsObject:taskId]);
 
                 if (task.state == NSURLSessionTaskStateRunning) {
-                    [task suspend];
-                    [task resume];
+                    // Running background download tasks should be left alone. Calling
+                    // suspend/resume during foreground transitions can briefly surface
+                    // the task as suspended to JS and may interfere with iOS scheduling.
+                    continue;
                 } else if (task.state == NSURLSessionTaskStateSuspended && !intentionallyPaused) {
                     DLog(taskId, @"[RNBackgroundDownloader] - [resumeTasks] resuming suspended task %@", taskId);
                     [task resume];
@@ -919,6 +921,43 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
             }
             NSDictionary *updatedHeaders = idToUpdatedHeadersMap[identifier];
 
+            // Prefer a live NSURLSession task over stale resume data. After app
+            // foreground/background transitions iOS may keep the original task
+            // alive while an older -999 completion has already populated resume
+            // data. Creating a second task from that stale resume data can make
+            // the restored download appear stuck or flip back to PAUSED.
+            if (task != nil && task.state == NSURLSessionTaskStateRunning) {
+                DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] task already running for %@", identifier);
+                RNBGDTaskConfig *taskConfig = [self findConfigById:identifier];
+                if (taskConfig != nil) {
+                    [self updateTaskMappings:task config:taskConfig];
+                    taskConfig.state = NSURLSessionTaskStateRunning;
+                    taskConfig.errorCode = 0;
+                    taskConfig.hasResumeData = NO;
+                    [mmkv setData:[self serialize:taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+                }
+                [self->idToResumeDataMap removeObjectForKey:identifier];
+                [self deleteResumeDataForTaskId:identifier];
+                resolve(nil);
+                return;
+            }
+
+            if (task != nil && task.state == NSURLSessionTaskStateSuspended) {
+                DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] resuming live suspended task for %@", identifier);
+                RNBGDTaskConfig *taskConfig = [self findConfigById:identifier];
+                if (taskConfig != nil) {
+                    taskConfig.state = NSURLSessionTaskStateRunning;
+                    taskConfig.errorCode = 0;
+                    taskConfig.hasResumeData = NO;
+                    [self updateTaskMappings:task config:taskConfig];
+                }
+                [self->idToResumeDataMap removeObjectForKey:identifier];
+                [self deleteResumeDataForTaskId:identifier];
+                [task resume];
+                resolve(nil);
+                return;
+            }
+
             // If no resume data in memory, try to load from file
             if (resumeData == nil) {
                 RNBGDTaskConfig *taskConfig = [self findConfigById:identifier];
@@ -983,6 +1022,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                         taskConfig.state = NSURLSessionTaskStateRunning;
                         taskConfig.errorCode = 0;
                         taskConfig.hasResumeData = NO; // Clear flag after resuming
+                        [self removeStaleTaskMappingsForId:identifier exceptTaskIdentifier:@(newTask.taskIdentifier)];
                         taskToConfigMap[@(newTask.taskIdentifier)] = taskConfig;
                         [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                     }
@@ -1019,6 +1059,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                             taskConfig.state = NSURLSessionTaskStateRunning;
                             taskConfig.errorCode = 0;
                             taskConfig.hasResumeData = NO;
+                            [self removeStaleTaskMappingsForId:identifier exceptTaskIdentifier:@(fallbackTask.taskIdentifier)];
                             taskToConfigMap[@(fallbackTask.taskIdentifier)] = taskConfig;
                             [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                             self->idToTaskMap[identifier] = fallbackTask;
@@ -1084,6 +1125,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                         taskConfig.state = NSURLSessionTaskStateRunning;
                         taskConfig.errorCode = 0;
                         taskConfig.hasResumeData = NO;
+                        [self removeStaleTaskMappingsForId:identifier exceptTaskIdentifier:@(newTask.taskIdentifier)];
                         taskToConfigMap[@(newTask.taskIdentifier)] = taskConfig;
                         [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                         self->idToTaskMap[identifier] = newTask;
@@ -1123,6 +1165,7 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                             taskConfig.state = NSURLSessionTaskStateRunning;
                             taskConfig.errorCode = 0;
                             taskConfig.hasResumeData = NO;
+                            [self removeStaleTaskMappingsForId:identifier exceptTaskIdentifier:@(newTask.taskIdentifier)];
                             taskToConfigMap[@(newTask.taskIdentifier)] = taskConfig;
                             [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                             self->idToTaskMap[identifier] = newTask;
@@ -1469,13 +1512,24 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
     taskConfig.reportedBegin = YES;
     taskConfig.bytesDownloaded = task.countOfBytesReceived;
     taskConfig.bytesTotal = task.countOfBytesExpectedToReceive;
-    taskConfig.state = task.state;
+
+    BOOL intentionallyPaused = [idsToPauseSet containsObject:taskConfig.id];
+    if (task.state == NSURLSessionTaskStateSuspended && !intentionallyPaused) {
+        // iOS can report a restored background task as suspended for a short
+        // window immediately after app foregrounding. Treat it as running so
+        // getExistingDownloadTasks().resume() does not bounce JS back to PAUSED.
+        taskConfig.state = NSURLSessionTaskStateRunning;
+    } else {
+        taskConfig.state = task.state;
+    }
     taskConfig.errorCode = task.error ? task.error.code : 0;
 
+    [self removeStaleTaskMappingsForId:taskConfig.id exceptTaskIdentifier:@(task.taskIdentifier)];
     taskToConfigMap[@(task.taskIdentifier)] = taskConfig;
     idToTaskMap[taskConfig.id] = task;
     idToPercentMap[taskConfig.id] = percent;
     idToLastBytesMap[taskConfig.id] = @(task.countOfBytesReceived);
+    [mmkv setData:[self serialize:taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
 }
 
 - (NSDictionary *)createTaskInfo:(NSURLSessionDownloadTask *)task config:(RNBGDTaskConfig *)taskConfig {
@@ -1612,6 +1666,23 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         }
     }
     return nil;
+}
+
+- (void)removeStaleTaskMappingsForId:(NSString *)taskId exceptTaskIdentifier:(NSNumber *)currentTaskIdentifier {
+    if (taskId == nil) {
+        return;
+    }
+
+    for (NSNumber *key in [[taskToConfigMap allKeys] copy]) {
+        if (currentTaskIdentifier != nil && [key isEqualToNumber:currentTaskIdentifier]) {
+            continue;
+        }
+
+        RNBGDTaskConfig *config = taskToConfigMap[key];
+        if ([config.id isEqualToString:taskId]) {
+            [taskToConfigMap removeObjectForKey:key];
+        }
+    }
 }
 
 - (NSString *)configIdForTask:(NSURLSessionTask *)task {
@@ -1976,9 +2047,13 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
             // Remove any stale task mapping for this identifier
             [self->idToTaskMap removeObjectForKey:taskConfig.id];
 
-            // Store resume data so we can resume the download later
+            // Store resume data so we can resume the download later, even if the
+            // app process is killed before JS calls resume(). Without this, iOS
+            // app switches can leave getExistingDownloadTasks() returning a paused
+            // item that cannot actually be resumed after relaunch.
             if (taskConfig.id && resumeData) {
                 idToResumeDataMap[taskConfig.id] = resumeData;
+                [self saveResumeData:resumeData forTaskId:taskConfig.id];
             }
 
             // Persist the pause state so getExistingDownloadTasks can recover it
@@ -2018,6 +2093,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
                 taskConfig.errorCode = 0;
                 taskConfig.bytesDownloaded = 0;
                 taskConfig.bytesTotal = 0;
+                [self removeStaleTaskMappingsForId:taskConfig.id exceptTaskIdentifier:@(newTask.taskIdentifier)];
                 taskToConfigMap[@(newTask.taskIdentifier)] = taskConfig;
                 [mmkv setData:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                 idToTaskMap[taskConfig.id] = newTask;
