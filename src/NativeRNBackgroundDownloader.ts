@@ -92,6 +92,9 @@ export interface Spec extends TurboModule {
   setAllowsCellularAccess(allows: boolean): void
   setNotificationGroupingConfig?(config: { enabled: boolean, showNotificationsEnabled: boolean, mode: string, texts: UnsafeObject }): void
 
+  // FIX: Auto-pause active tasks when app goes to background
+  autoPauseActiveTasks(): Promise<void>
+
   getExistingDownloadTasks(): Promise<Array<{
     id: string
     metadata: string

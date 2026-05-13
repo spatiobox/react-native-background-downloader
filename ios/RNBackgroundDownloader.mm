@@ -343,6 +343,52 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     [self unregisterBridgeListener];
 }
 
+// FIX: Auto-pause active tasks when app enters background to ensure resume data is saved
+- (void)autoPauseActiveTasks {
+    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] auto-pausing active tasks for background transition");
+
+    @synchronized (sharedLock) {
+        // Get all active tasks from the session
+        if (urlSession != nil) {
+            [urlSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> * _Nonnull dataTasks,
+                                                        NSArray<NSURLSessionUploadTask *> * _Nonnull uploadTasks,
+                                                        NSArray<NSURLSessionDownloadTask *> * _Nonnull downloadTasks) {
+                for (NSURLSessionDownloadTask *task in downloadTasks) {
+                    if (task.state == NSURLSessionTaskStateRunning) {
+                        NSString *taskId = [self configIdForTask:task];
+                        if (taskId != nil && ![self->idsToPauseSet containsObject:taskId]) {
+                            DLog(taskId, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] auto-pausing task: %@", taskId);
+
+                            // Mark as pausing and cancel with resume data
+                            [self->idsToPauseSet addObject:taskId];
+                            [task cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
+                                @synchronized (self->sharedLock) {
+                                    if (resumeData != nil) {
+                                        self->idToResumeDataMap[taskId] = resumeData;
+
+                                        // Save resume data and update config
+                                        RNBGDTaskConfig *taskConfig = self->taskToConfigMap[@(task.taskIdentifier)];
+                                        if (taskConfig) {
+                                            [self saveResumeData:resumeData forTaskId:taskId];
+                                            taskConfig.hasResumeData = YES;
+                                            taskConfig.state = NSURLSessionTaskStateCanceling;
+                                            taskConfig.errorCode = -999;
+                                            [self->mmkv setData:[self serialize:self->taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+                                            DLog(taskId, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] saved resume data for auto-paused task: %@", taskId);
+                                        }
+                                    } else {
+                                        DLog(taskId, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] no resume data for auto-paused task: %@", taskId);
+                                    }
+                                }
+                            }];
+                        }
+                    }
+                }
+            }];
+        }
+    }
+}
+
 - (void)handleBridgeHotReload:(NSNotification *) note {
     DLog(nil, @"[RNBackgroundDownloader] - [handleBridgeHotReload]");
     [self unregisterSession];
@@ -375,6 +421,7 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 - (void)activateSession {
     DLog(nil, @"[RNBackgroundDownloader] - [activateSession]");
     [self sendDebugLog:@"activateSession: calling getTasksWithCompletionHandler" taskId:nil];
+
     [urlSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> * _Nonnull dataTasks, NSArray<NSURLSessionUploadTask *> * _Nonnull uploadTasks, NSArray<NSURLSessionDownloadTask *> * _Nonnull downloadTasks) {
         @synchronized (self->sharedLock) {
             NSString *logMsg = [NSString stringWithFormat:@"activateSession: session activated, pendingDownloads=%lu, existingTasks=%lu",
@@ -382,12 +429,31 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
             DLog(nil, @"[RNBackgroundDownloader] - %@", logMsg);
             [self sendDebugLog:logMsg taskId:nil];
 
+            // FIX: 追踪这个激活周期处理的任务 ID
+            NSMutableSet *processedTaskIds = [NSMutableSet new];
+
             // Process existing download tasks to ensure they are properly mapped
-            // This is important when the app returns to foreground and system has restored background tasks
             for (NSURLSessionDownloadTask *task in downloadTasks) {
                 RNBGDTaskConfig *taskConfig = [self findAndReconcileTaskConfig:task];
                 if (taskConfig) {
                     [self updateTaskMappings:task config:taskConfig];
+                    [processedTaskIds addObject:taskConfig.id];
+                } else {
+                    DLog(nil, @"[RNBackgroundDownloader] - [activateSession] unable to reconcile task, leaving it alive for future recovery");
+                    [self sendDebugLog:@"activateSession: found unknown task, not cancelling" taskId:nil];
+                }
+            }
+
+            // FIX: 清理 idToTaskMap 中的孤立任务（来自已完成或已失败的旧会话）
+            NSArray *taskIdsToClean = [self->idToTaskMap allKeys];
+            for (NSString *taskId in taskIdsToClean) {
+                if (![processedTaskIds containsObject:taskId]) {
+                    // 检查这是否真的是一个孤立的任务
+                    NSURLSessionDownloadTask *mappedTask = self->idToTaskMap[taskId];
+                    if (mappedTask && mappedTask.state == NSURLSessionTaskStateCompleted) {
+                        DLog(taskId, @"[RNBackgroundDownloader] - [activateSession] cleaning up completed task: %@", taskId);
+                        [self->idToTaskMap removeObjectForKey:taskId];
+                    }
                 }
             }
 
@@ -430,9 +496,19 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
                                                   object:nil];
 
             [[NSNotificationCenter defaultCenter] addObserver:self
+                                                  selector:@selector(handleBridgeAppEnterBackground:)
+                                                      name:UIApplicationWillResignActiveNotification
+                                                    object:nil];
+
+            [[NSNotificationCenter defaultCenter] addObserver:self
+                                                  selector:@selector(handleBridgeAppEnterBackground:)
+                                                      name:UIApplicationDidEnterBackgroundNotification
+                                                    object:nil];
+
+            [[NSNotificationCenter defaultCenter] addObserver:self
                                                   selector:@selector(handleBridgeHotReload:)
-                                                  name:RCTJavaScriptWillStartLoadingNotification
-                                                  object:nil];
+                                                      name:RCTJavaScriptWillStartLoadingNotification
+                                                    object:nil];
         }
     }
 }
@@ -449,6 +525,11 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     DLog(nil, @"[RNBackgroundDownloader] - [handleBridgeAppEnterForeground]");
     [self lazyRegisterSession];
     [self resumeTasks];
+}
+
+- (void)handleBridgeAppEnterBackground:(NSNotification *) note {
+    DLog(nil, @"[RNBackgroundDownloader] - [handleBridgeAppEnterBackground]");
+    [self autoPauseActiveTasks];
 }
 
 - (void)resumeTasks {
@@ -527,6 +608,23 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 #else
 RCT_EXPORT_METHOD(setLogsEnabled:(BOOL)enabled) {
     [self _setLogsEnabledInternal:enabled];
+}
+#endif
+
+// FIX: Export method to auto-pause active tasks when app goes to background
+- (void)_autoPauseActiveTasksInternal:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] called from JS");
+    [self autoPauseActiveTasks];
+    resolve(nil);
+}
+
+#ifdef RCT_NEW_ARCH_ENABLED
+- (void)autoPauseActiveTasks:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    [self _autoPauseActiveTasksInternal:resolve reject:reject];
+}
+#else
+RCT_EXPORT_METHOD(autoPauseActiveTasks:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject) {
+    [self _autoPauseActiveTasksInternal:resolve reject:reject];
 }
 #endif
 
@@ -951,6 +1049,18 @@ RCT_EXPORT_METHOD(pauseTask:(NSString *)id resolver:(RCTPromiseResolveBlock)reso
                     // Delete the resume data file after successful resume
                     [self deleteResumeDataForTaskId:identifier];
                     [newTask resume];
+                }
+            } else if (task != nil && task.state == NSURLSessionTaskStateRunning) {
+                // Already active. getExistingDownloadTasks may have called restoreTaskIfNeeded which
+                // resumed the task; JS often calls resume() on every restored task — must be a no-op.
+                DLog(identifier, @"[RNBackgroundDownloader] - [resumeTask] task already running for %@", identifier);
+                RNBGDTaskConfig *taskConfig = taskToConfigMap[@(task.taskIdentifier)];
+                if (taskConfig == nil) {
+                    taskConfig = [self findConfigById:identifier];
+                }
+                if (taskConfig != nil) {
+                    taskConfig.state = task.state;
+                    taskConfig.errorCode = task.error ? task.error.code : 0;
                 }
             } else if (task != nil && task.state == NSURLSessionTaskStateSuspended) {
                 // Task was suspended normally, just resume it
@@ -1411,6 +1521,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 
             [foundTasks addObject:[self createTaskInfoFromConfig:taskConfig]];
             [processedIds addObject:taskId];
+            DLog(taskId, @"[RNBackgroundDownloader] - [addPausedTasksToResults] found task with resume data in memory: %@", taskId);
         }
     }
 
@@ -1445,6 +1556,35 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
                 [mmkv setData:[self serialize:taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
                 DLog(taskConfig.id, @"[RNBackgroundDownloader] - [addPausedTasksToResults] resume data file not found for task: %@", taskConfig.id);
             }
+        }
+    }
+
+    // FIX: Enhanced fallback - recover ALL tasks from taskToConfigMap that have progress
+    // This handles cases where tasks were cancelled by the system during app switch
+    for (RNBGDTaskConfig *taskConfig in [taskToConfigMap allValues]) {
+        if ([processedIds containsObject:taskConfig.id]) {
+            continue;
+        }
+
+        // If task has made progress (downloaded bytes > 0), it should be recoverable
+        if (taskConfig.bytesDownloaded > 0) {
+            // Check if we have resume data for this task
+            NSData *resumeData = [self loadResumeDataForTaskId:taskConfig.id];
+            if (resumeData != nil) {
+                idToResumeDataMap[taskConfig.id] = resumeData;
+                taskConfig.hasResumeData = YES;
+                taskConfig.state = NSURLSessionTaskStateCanceling;
+                taskConfig.errorCode = -999;
+                DLog(taskConfig.id, @"[RNBackgroundDownloader] - [addPausedTasksToResults] recovered task with progress from storage: %@", taskConfig.id);
+            } else {
+                // No resume data, but task has progress - mark as cancelled so it can be restarted
+                taskConfig.state = NSURLSessionTaskStateCanceling;
+                taskConfig.errorCode = NSURLErrorCancelled;
+                DLog(taskConfig.id, @"[RNBackgroundDownloader] - [addPausedTasksToResults] recovered task without resume data: %@", taskConfig.id);
+            }
+
+            [foundTasks addObject:[self createTaskInfoFromConfig:taskConfig]];
+            [processedIds addObject:taskConfig.id];
         }
     }
 

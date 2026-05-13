@@ -508,6 +508,12 @@ export const completeHandler = (jobId: string) => {
   return nativeModule.completeHandler(jobId)
 }
 
+// FIX: Auto-pause active tasks when app goes to background
+export const autoPauseActiveTasks = async (): Promise<void> => {
+  const nativeModule = ensureNativeModuleInitialized()
+  return nativeModule.autoPauseActiveTasks()
+}
+
 export function createDownloadTask ({
   isAllowedOverRoaming = true,
   isAllowedOverMetered = true,
