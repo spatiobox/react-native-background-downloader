@@ -343,50 +343,12 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
     [self unregisterBridgeListener];
 }
 
-// FIX: Auto-pause active tasks when app enters background to ensure resume data is saved
+// Background NSURLSession transfers continue while the app is backgrounded.
+// Do not cancel running downloads on app background transitions: cancelByProducingResumeData
+// converts them into paused tasks and prevents iOS from continuing the transfer in the
+// background. Pause should only happen when JS explicitly calls pauseTask.
 - (void)autoPauseActiveTasks {
-    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] auto-pausing active tasks for background transition");
-
-    @synchronized (sharedLock) {
-        // Get all active tasks from the session
-        if (urlSession != nil) {
-            [urlSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> * _Nonnull dataTasks,
-                                                        NSArray<NSURLSessionUploadTask *> * _Nonnull uploadTasks,
-                                                        NSArray<NSURLSessionDownloadTask *> * _Nonnull downloadTasks) {
-                for (NSURLSessionDownloadTask *task in downloadTasks) {
-                    if (task.state == NSURLSessionTaskStateRunning) {
-                        NSString *taskId = [self configIdForTask:task];
-                        if (taskId != nil && ![self->idsToPauseSet containsObject:taskId]) {
-                            DLog(taskId, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] auto-pausing task: %@", taskId);
-
-                            // Mark as pausing and cancel with resume data
-                            [self->idsToPauseSet addObject:taskId];
-                            [task cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
-                                @synchronized (self->sharedLock) {
-                                    if (resumeData != nil) {
-                                        self->idToResumeDataMap[taskId] = resumeData;
-
-                                        // Save resume data and update config
-                                        RNBGDTaskConfig *taskConfig = self->taskToConfigMap[@(task.taskIdentifier)];
-                                        if (taskConfig) {
-                                            [self saveResumeData:resumeData forTaskId:taskId];
-                                            taskConfig.hasResumeData = YES;
-                                            taskConfig.state = NSURLSessionTaskStateCanceling;
-                                            taskConfig.errorCode = -999;
-                                            [self->mmkv setData:[self serialize:self->taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
-                                            DLog(taskId, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] saved resume data for auto-paused task: %@", taskId);
-                                        }
-                                    } else {
-                                        DLog(taskId, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] no resume data for auto-paused task: %@", taskId);
-                                    }
-                                }
-                            }];
-                        }
-                    }
-                }
-            }];
-        }
-    }
+    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] deprecated no-op; background downloads continue via NSURLSession");
 }
 
 - (void)handleBridgeHotReload:(NSNotification *) note {
@@ -529,7 +491,10 @@ static const int kMaxEventRetries = 50;  // 50 retries * 100ms = 5 seconds max w
 
 - (void)handleBridgeAppEnterBackground:(NSNotification *) note {
     DLog(nil, @"[RNBackgroundDownloader] - [handleBridgeAppEnterBackground]");
-    [self autoPauseActiveTasks];
+    // Keep the background session registered, but leave active downloads running.
+    // iOS will continue background NSURLSessionDownloadTask instances after the app
+    // moves to the background.
+    [self lazyRegisterSession];
 }
 
 - (void)resumeTasks {
@@ -611,9 +576,10 @@ RCT_EXPORT_METHOD(setLogsEnabled:(BOOL)enabled) {
 }
 #endif
 
-// FIX: Export method to auto-pause active tasks when app goes to background
+// Deprecated compatibility method. It intentionally does not pause tasks because
+// background NSURLSession downloads must remain active to continue outside the app.
 - (void)_autoPauseActiveTasksInternal:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
-    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] called from JS");
+    DLog(nil, @"[RNBackgroundDownloader] - [autoPauseActiveTasks] deprecated no-op called from JS");
     [self autoPauseActiveTasks];
     resolve(nil);
 }
