@@ -1483,7 +1483,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         DLog(taskId, @"[RNBackgroundDownloader] - [restoreTaskIfNeeded] resuming cancelled task with resume data %@", taskId);
         NSURLSessionDownloadTask *newTask = [urlSession downloadTaskWithResumeData:resumeData];
         if (newTask != nil) {
-            newTask.taskDescription = task.taskDescription;
+            newTask.taskDescription = taskId ?: task.taskDescription;
             *taskPtr = newTask;
             [newTask resume];
         }
@@ -1496,7 +1496,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
             DLog(taskId, @"[RNBackgroundDownloader] - [restoreTaskIfNeeded] restarting cancelled task %@", taskId);
             NSURLSessionDownloadTask *newTask = [urlSession downloadTaskWithURL:taskURL];
             if (newTask != nil) {
-                newTask.taskDescription = task.taskDescription;
+                newTask.taskDescription = taskId ?: task.taskDescription;
                 *taskPtr = newTask;
                 [newTask resume];
             }
@@ -2033,19 +2033,38 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
         // Extract resume data first before checking isPausedTask
         NSData *resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData];
 
-        // Treat any known task cancelled by the system as a paused task.
-        // This includes app switch / background cancel events where iOS may deliver -999.
+        // Treat cancellations as resumable only when they belong to the current
+        // logical task. A stale -999 callback from an older task can arrive after
+        // resumeTask has already created/recovered a replacement task; do not let
+        // that old callback overwrite the running task as paused or remove it from
+        // idToTaskMap.
         BOOL wasIntentionallyPaused = [idsToPauseSet containsObject:taskConfig.id];
         BOOL hasResumeData = resumeData != nil;
-        BOOL isPausedTask = (error.code == NSURLErrorCancelled && (wasIntentionallyPaused || hasResumeData || taskConfig != nil));
+        NSURLSessionDownloadTask *mappedTask = self->idToTaskMap[taskConfig.id];
+        BOOL hasLiveReplacementTask = mappedTask != nil &&
+            mappedTask.taskIdentifier != task.taskIdentifier &&
+            mappedTask.state != NSURLSessionTaskStateCompleted &&
+            mappedTask.state != NSURLSessionTaskStateCanceling;
+
+        if (error.code == NSURLErrorCancelled && hasLiveReplacementTask) {
+            DLog(taskConfig.id, @"[RNBackgroundDownloader] - [didCompleteWithError] ignoring stale cancellation for replaced task %@", taskConfig.id);
+            [self sendDebugLog:@"didCompleteWithError: ignoring stale cancellation for replaced task" taskId:taskConfig.id];
+            return;
+        }
+
+        BOOL canRestartKnownCancelledTask = taskConfig.bytesDownloaded > 0;
+        BOOL isPausedTask = (error.code == NSURLErrorCancelled && (wasIntentionallyPaused || hasResumeData || canRestartKnownCancelledTask));
 
         if (isPausedTask) {
             taskConfig.state = NSURLSessionTaskStateCanceling;
             taskConfig.errorCode = error.code;
             taskConfig.hasResumeData = hasResumeData;
 
-            // Remove any stale task mapping for this identifier
-            [self->idToTaskMap removeObjectForKey:taskConfig.id];
+            // Remove only this task's mapping. If a replacement task was already
+            // registered, keep it so getExistingDownloadTasks can still find it.
+            if (mappedTask == nil || mappedTask.taskIdentifier == task.taskIdentifier) {
+                [self->idToTaskMap removeObjectForKey:taskConfig.id];
+            }
 
             // Store resume data so we can resume the download later, even if the
             // app process is killed before JS calls resume(). Without this, iOS
@@ -2088,6 +2107,7 @@ RCT_EXPORT_METHOD(getExistingDownloadTasks: (RCTPromiseResolveBlock)resolve reje
 
             NSURLSessionDownloadTask *newTask = [urlSession downloadTaskWithRequest:request];
             if (newTask != nil) {
+                newTask.taskDescription = taskConfig.id;
                 // Reset task state for fresh attempt
                 taskConfig.state = NSURLSessionTaskStateRunning;
                 taskConfig.errorCode = 0;
